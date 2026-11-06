@@ -27,6 +27,15 @@ export interface GroupSpec {
 /** One adjustable column section (navigation or workspaces). */
 export interface SectionSpec {
   groups: GroupSpec[]
+  /**
+   * Whether the shipped preset has already been applied to this section.
+   *
+   * The default groups are never empty (the panel starts with 常用 + 更多), so
+   * "no groups" cannot stand for "never configured" — and without this flag a
+   * fresh install would push every id into the folded group and never apply the
+   * preset it ships with.
+   */
+  configured?: boolean
 }
 
 export interface SidebarGroupsState {
@@ -75,12 +84,16 @@ export function defaultState(): SidebarGroupsState {
     version: STATE_VERSION,
     scrolling: true,
     nav: {
+      configured: false,
       groups: [
         { id: TOP_GROUP_ID, label: '常用', collapsed: false, showHeader: false, items: [] },
         { id: MORE_GROUP_ID, label: '更多', collapsed: true, showHeader: true, items: [] },
       ],
     },
     workspaces: {
+      // The workspace side has no preset to apply: one catch-all group means
+      // "no grouping", which is the visual no-op the plugin ships with.
+      configured: true,
       groups: [{ id: WORKSPACE_GROUP_ID, label: '工作区', collapsed: false, showHeader: false, items: [] }],
     },
   }
@@ -129,8 +142,14 @@ export function normalizeState(raw: unknown): SidebarGroupsState {
   return {
     version: typeof record.version === 'number' ? record.version : STATE_VERSION,
     scrolling: record.scrolling !== false,
-    nav: { groups: normalizeGroups(nav?.groups, base.nav.groups) },
-    workspaces: { groups: normalizeGroups(workspaces?.groups, base.workspaces.groups) },
+    nav: {
+      groups: normalizeGroups(nav?.groups, base.nav.groups),
+      configured: nav?.configured === true,
+    },
+    workspaces: {
+      groups: normalizeGroups(workspaces?.groups, base.workspaces.groups),
+      configured: workspaces?.configured !== false,
+    },
   }
 }
 
@@ -162,6 +181,7 @@ export function resolveDefaultNavGroups(entries: readonly NavEntry[]): SectionSp
   }
   const more = sorted.filter(entry => !top.includes(entry.id)).map(entry => entry.id)
   return {
+    configured: true,
     groups: [
       { id: TOP_GROUP_ID, label: '常用', collapsed: false, showHeader: false, items: top },
       { id: MORE_GROUP_ID, label: '更多', collapsed: true, showHeader: true, items: more },
@@ -174,6 +194,12 @@ export interface SyncResult {
   changed: boolean
 }
 
+/** One section's reconcile result (see `syncSection`). */
+interface SectionSync {
+  spec: SectionSpec
+  changed: boolean
+}
+
 /**
  * Reconcile a stored section against what is actually registered right now.
  *
@@ -183,12 +209,28 @@ export interface SyncResult {
  * - New ids (a freshly installed panel) join the LAST group, which is the
  *   folded one — a new panel must not push itself into the always-open top set.
  */
-function syncSection(spec: SectionSpec, knownIds: readonly string[], preset: (() => SectionSpec) | null): SyncResult {
+function itemCount(groups: readonly GroupSpec[]): number {
+  let total = 0
+  for (const group of groups) total += group.items.length
+  return total
+}
+
+/** True when this document holds no placement at all (nothing to persist). */
+export function isBlankState(state: SidebarGroupsState): boolean {
+  return itemCount(state.nav.groups) === 0 && itemCount(state.workspaces.groups) === 0
+}
+
+function syncSection(spec: SectionSpec, knownIds: readonly string[], preset: (() => SectionSpec) | null): SectionSync {
   let changed = false
   const live = spec.groups.filter(group => group.id !== '')
+  // "configured" describes a POPULATED document, never a promise. A document
+  // that claims to be configured but holds not one item is the poisoned shape
+  // earlier releases could persist (an empty preset written at boot, before the
+  // registry had anything in it) — it is re-seeded instead of trusted.
+  const wasConfigured = spec.configured === true && itemCount(live) > 0
   let groups: GroupSpec[]
-  if (live.length === 0 && preset !== null) {
-    groups = preset().groups
+  if (preset !== null && !wasConfigured) {
+    groups = preset().groups.map(group => ({ ...group, items: [...group.items] }))
     changed = true
   } else {
     groups = live.map(group => ({ ...group, items: [...group.items] }))
@@ -206,7 +248,10 @@ function syncSection(spec: SectionSpec, knownIds: readonly string[], preset: (()
       changed = true
     }
   }
-  return { state: { version: STATE_VERSION, scrolling: true, nav: { groups }, workspaces: { groups: [] } }, changed }
+  const populated = itemCount(groups) > 0
+  const configured = populated && (wasConfigured || changed)
+  if (spec.configured !== configured) changed = true
+  return { spec: { groups, configured }, changed }
 }
 
 /** Navigation side of {@link syncSection}: preset comes from the registry. */
@@ -215,7 +260,7 @@ export function syncNavGroups(state: SidebarGroupsState, entries: readonly NavEn
   const ids = sortEntries(entries).map(entry => entry.id)
   const result = syncSection(state.nav, ids, () => resolveDefaultNavGroups(entries))
   if (!result.changed) return { state, changed: false }
-  return { state: { ...state, nav: result.state.nav }, changed: true }
+  return { state: { ...state, nav: result.spec }, changed: true }
 }
 
 /** Group order as an array so the panel can move whole groups up and down. */

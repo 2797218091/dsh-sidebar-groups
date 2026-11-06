@@ -15,13 +15,13 @@
  */
 import { Fragment, createElement as h, useState } from 'react'
 import { defaultState, normalizeState, resolveDefaultNavGroups, sortEntries, type NavEntry } from './config.js'
-import { DomAdapter, MARKS, SELECTORS } from './dom-adapter.js'
+import { DomAdapter, MARKS, SELECTORS, activeAdapter } from './dom-adapter.js'
 import { GroupPanelPortal } from './panel'
 import { SidebarGroupsStore } from './store.js'
 
 export { defaultState, normalizeState, resolveDefaultNavGroups, sortEntries }
 export type { GroupSpec, NavEntry, SectionSpec, SidebarGroupsState } from './config.js'
-export { DomAdapter, MARKS, SELECTORS }
+export { activeAdapter, DomAdapter, MARKS, SELECTORS }
 export { SidebarGroupsStore }
 export type { SectionName, StoreOptions } from './store.js'
 export { GroupPanel, GroupPanelPortal } from './panel'
@@ -113,6 +113,7 @@ function FooterAction(props: {
   store: SidebarGroupsStore
   entries(): NavEntry[]
   workspaces(): string[]
+  diagnostics(): string
   wide?: boolean
 }) {
   const [open, setOpen] = useState(false)
@@ -144,6 +145,7 @@ function FooterAction(props: {
         store: props.store,
         entries: props.entries,
         workspaces: props.workspaces,
+        diagnostics: props.diagnostics,
         onClose: () => setOpen(false),
       })
     : null
@@ -176,18 +178,48 @@ export function apply(ctx: ClientContext): void {
     return entries
   }
 
+  /** One line the panel shows verbatim, so a live install needs no console. */
+  const diagnostics = (): string => {
+    const current = adapter
+    const state = store.get()
+    return [
+      'host=' + store.hostStatus(),
+      current === null
+        ? 'adapter=absent reason=never-mounted entries=none retries=0 workspaces=0 rows=0 navBox=0 planned=0 unmatched=0 hidden=0 navH=0 boxH=0 lastLog='
+        : current.describe(),
+      'registry=' + String(entries.length),
+      'entriesOfSlot=' + typeof slots?.entriesOfSlot,
+      'adoptSkips=' + String(store.adoptSkips()),
+      'groups=' + String(state.nav.groups.length) + '/' + String(state.workspaces.groups.length),
+      'scrolling=' + (state.scrolling ? 'on' : 'off'),
+    ].join(' ')
+  }
+
   const mountAdapter = (): void => {
-    if (adapter !== null) return
+    if (adapter !== null) { adapter.refresh(); return }
     try {
       adapter = new DomAdapter({}, {
         state: () => store.get(),
         entries: () => entries,
         setNavCollapsed: (groupId, collapsed) => store.setGroupCollapsed('nav', groupId, collapsed),
         setWorkspaceCollapsed: (groupId, collapsed) => store.setGroupCollapsed('workspaces', groupId, collapsed),
-        // Deferred: the adapter calls this from inside a render, and writing the
-        // state there would re-enter the subscription that triggers renders.
-        onWorkspaces: keys => { setTimeout(() => { store.noteWorkspaceKeys(keys) }, 0) },
+        // Both callbacks are deferred: the adapter calls them from inside a
+        // render, and writing the state there would re-enter the subscription
+        // that triggers renders.
+        onWorkspaces: keys => { setTimeout(() => { try { store.noteWorkspaceKeys(keys) } catch { /* never throw in a timer */ } }, 0) },
+        // Degraded mode only: with NO usable registry API the adapter derives
+        // ids from the rendered rows, in registration order, and hands them back
+        // so the preset and the persisted placement still work. A merely
+        // TRANSIENT empty list is not degraded mode — adopting dom:-derived ids
+        // there is what once overwrote a good document mid-session.
+        onEntries: (list, source) => {
+          if (source !== 'dom') return
+          if (typeof slots?.entriesOfSlot === 'function') return
+          setTimeout(() => { try { store.adoptEntries(list) } catch { /* never throw in a timer */ } }, 0)
+        },
       })
+      // mount() arms its own bounded retry ladder when the DOM is not there
+      // yet; every later signal lands on refresh(), which mounts if needed.
       adapter.mount()
       store.subscribe(refreshSoon)
     } catch { adapter = null }
@@ -209,13 +241,20 @@ export function apply(ctx: ClientContext): void {
         store,
         entries: read,
         workspaces: () => (adapter?.getWorkspaces().length ? adapter.getWorkspaces() : store.workspaceKeys()),
+        diagnostics,
         wide: props?.wide !== false,
       } as never)))
     } catch { /* a slot registration failure must not take the entry down */ }
     // Labels are re-resolved whenever the registry changes: a locale switch
     // does NOT fire the slot subscription (DOM-CONTRACT.md §B.4), so the locale
     // side below subscribes again to the same reader.
-    const off = slots.subscribe?.('sidebar.panellist', () => { read(); refreshSoon() })
+    const off = slots.subscribe?.('sidebar.panellist', () => {
+      // Re-adopt, not just re-read: entries can arrive AFTER this plugin
+      // activates, and adoption is what applies the shipped preset the first
+      // time the registry is actually populated.
+      store.adoptEntries(read())
+      refreshSoon()
+    })
     if (typeof off === 'function' && typeof ready.effect === 'function') {
       try { ready.effect(() => off, 'dsh-sidebar-groups: panellist') } catch { /* host without effect */ }
     }
@@ -227,7 +266,7 @@ export function apply(ctx: ClientContext): void {
     const subscribe = ready.locale?.subscribe
     if (typeof subscribe !== 'function') return
     try {
-      const off = subscribe.call(ready.locale, () => { read(); refreshSoon() })
+      const off = subscribe.call(ready.locale, () => { store.adoptEntries(read()); refreshSoon() })
       if (typeof off === 'function' && typeof ready.effect === 'function') {
         try { ready.effect(() => off, 'dsh-sidebar-groups: locale') } catch { /* host without effect */ }
       }

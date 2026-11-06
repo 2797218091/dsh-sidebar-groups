@@ -17,6 +17,12 @@ export interface GroupPanelProps {
   entries(): NavEntry[]
   /** Live workspace section labels read off the DOM. */
   workspaces(): string[]
+  /**
+   * One plain-text line describing the adapter's state. It exists because the
+   * interesting failures (React not painted yet, drawer mode, the 56px rail)
+   * are invisible in the UI: the plugin looks installed and does nothing.
+   */
+  diagnostics(): string
   onClose(): void
 }
 
@@ -183,7 +189,7 @@ function Section(props: {
 }
 
 export function GroupPanel(props: GroupPanelProps) {
-  const { store, entries, workspaces, onClose } = props
+  const { store, entries, workspaces, diagnostics, onClose } = props
   const state = useStore(store)
   const navEntries = entries()
   const navIds = navEntries.map(entry => entry.id)
@@ -236,6 +242,19 @@ export function GroupPanel(props: GroupPanelProps) {
             spec={state.workspaces}
             store={store}
           />
+        </div>
+        <div
+          style={{
+            padding: '6px 14px 0',
+            fontSize: '10.5px',
+            lineHeight: '15px',
+            opacity: .62,
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+            wordBreak: 'break-all',
+          }}
+          title={diagnostics()}
+        >
+          {diagnostics()}
         </div>
         <footer style={{ display: 'flex', gap: '8px', padding: '10px 14px', borderTop: '1px solid var(--dsw-alias-border-subtle, rgba(128,128,128,.18))' }}>
           <button type="button" style={CLICK} onClick={() => store.reset(navEntries)}>恢复默认</button>

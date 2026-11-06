@@ -24,6 +24,15 @@ export interface GroupSpec {
 /** One adjustable column section (navigation or workspaces). */
 export interface SectionSpec {
     groups: GroupSpec[];
+    /**
+     * Whether the shipped preset has already been applied to this section.
+     *
+     * The default groups are never empty (the panel starts with 常用 + 更多), so
+     * "no groups" cannot stand for "never configured" — and without this flag a
+     * fresh install would push every id into the folded group and never apply the
+     * preset it ships with.
+     */
+    configured?: boolean;
 }
 export interface SidebarGroupsState {
     version: number;
@@ -54,6 +63,8 @@ export interface SyncResult {
     state: SidebarGroupsState;
     changed: boolean;
 }
+/** True when this document holds no placement at all (nothing to persist). */
+export declare function isBlankState(state: SidebarGroupsState): boolean;
 /** Navigation side of {@link syncSection}: preset comes from the registry. */
 export declare function syncNavGroups(state: SidebarGroupsState, entries: readonly NavEntry[]): SyncResult;
 /** Group order as an array so the panel can move whole groups up and down. */

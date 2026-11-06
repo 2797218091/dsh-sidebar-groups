@@ -8,6 +8,7 @@
  */
 import {
   defaultState,
+  isBlankState,
   normalizeState,
   syncNavGroups,
   type NavEntry,
@@ -33,6 +34,14 @@ export interface StoreOptions {
   persistDelay?: number
 }
 
+/** The shape our own host routes answer with (never a 5xx, always a body). */
+interface RoutePayload {
+  ok?: unknown
+  state?: unknown
+  error?: unknown
+  revision?: unknown
+}
+
 export type SectionName = 'nav' | 'workspaces'
 
 type Listener = (state: SidebarGroupsState) => void
@@ -43,6 +52,8 @@ export class SidebarGroupsStore {
   private readonly options: StoreOptions
   private persistTimer: ReturnType<typeof setTimeout> | null = null
   private loaded = false
+  private host = 'none'
+  private adoptSkipped = 0
   /** Live workspace section labels, kept out of the persisted document. */
   private workspaces: string[] = []
 
@@ -65,11 +76,33 @@ export class SidebarGroupsStore {
     }
   }
 
-  /** Replace the whole state (already normalized) and notify. */
+  /**
+   * Replace the whole state (already normalized) and notify.
+   *
+   * A document with no placement at all is NEVER written: that is exactly the
+   * shape a boot-time race can produce (no registry yet), and persisting it
+   * would poison every later session with a "configured but empty" document.
+   * The in-memory state still updates, so the UI shows the truth.
+   */
   replace(next: SidebarGroupsState, persist = true): void {
     this.state = normalizeState(next)
     this.emit()
-    if (persist) this.schedulePersist()
+    if (persist && !isBlankState(this.state)) this.schedulePersist()
+  }
+
+  /** 'none' until a route answers; 'ok' / 'err:<message>' after that. */
+  hostStatus(): string {
+    return this.host
+  }
+
+  /** How many adoptions were skipped because the id set was empty. */
+  adoptSkips(): number {
+    return this.adoptSkipped
+  }
+
+  /** What the last route answer was, for the diagnostics line. */
+  private markHost(ok: boolean, message?: string): void {
+    this.host = ok ? 'ok' : 'err:' + (message === undefined || message === '' ? 'unknown' : message)
   }
 
   private section(name: SectionName): SectionSpec {
@@ -79,6 +112,12 @@ export class SidebarGroupsStore {
   private mutate(change: (draft: SidebarGroupsState) => boolean, persist = true): void {
     const draft = normalizeState(this.state)
     if (!change(draft)) return
+    // A user edit is the other way a section becomes "configured" — and only
+    // when it actually left something behind, which is what `syncSection`
+    // checks too (a configured-but-empty document is re-seeded).
+    for (const name of ['nav', 'workspaces'] as const) {
+      if (draft[name].groups.some(group => group.items.length > 0)) draft[name].configured = true
+    }
     this.replace(draft, persist)
   }
 
@@ -188,8 +227,19 @@ export class SidebarGroupsStore {
    * for the common case — a state write here would loop the MutationObserver.
    */
   adoptEntries(entries: readonly NavEntry[]): boolean {
+    // An EMPTY id set is "no information", never "nothing is configured".
+    // Adopting it would re-seed an empty preset and wipe a good document — the
+    // failure mode that made a rendered grouping vanish on a window resize.
+    // Only a non-empty id set may recompute, mark, persist or re-render.
+    if (!Array.isArray(entries) || entries.length === 0) {
+      this.adoptSkipped += 1
+      return false
+    }
     const result = syncNavGroups(this.state, entries)
     if (!result.changed) return false
+    // `replace` refuses to persist a blank document, so an adoption that has
+    // nothing to place (an empty registry, a preset that matched nothing) can
+    // never reach the host.
     this.replace(result.state)
     return true
   }
@@ -279,15 +329,25 @@ export class SidebarGroupsStore {
     if (url === null || fetchImpl === null) return
     try {
       const response = await fetchImpl(url, { method: 'GET', headers: { accept: 'application/json' } })
-      if (!response.ok) return
-      const payload = (await response.json()) as { state?: unknown }
-      const remote = payload?.state
+      if (!response.ok) { this.markHost(false, 'http ' + String(response.status)); return }
+      let payload: RoutePayload | null = null
+      try { payload = (await response.json()) as RoutePayload } catch { payload = null }
+      if (payload === null) { this.markHost(false, 'bad json'); return }
+      if (payload.ok === false) {
+        this.markHost(false, typeof payload.error === 'string' ? payload.error : 'route refused')
+        return
+      }
+      this.markHost(true)
+      const remote = payload.state
       if (remote === null || remote === undefined) return
       this.replace(normalizeState(remote), false)
-    } catch { /* keep whatever we have */ }
+    } catch (error) {
+      this.markHost(false, error instanceof Error ? error.message : String(error))
+    }
   }
 
   schedulePersist(delay = this.options.persistDelay ?? 350): void {
+    if (isBlankState(this.state)) return
     this.writeLocal()
     if (this.persistTimer !== null) clearTimeout(this.persistTimer)
     this.persistTimer = setTimeout(() => {
@@ -300,14 +360,26 @@ export class SidebarGroupsStore {
   async flush(): Promise<boolean> {
     const url = this.routeUrl('update')
     const fetchImpl = this.fetchImpl
-    if (url === null || fetchImpl === null) return false
+    if (url === null || fetchImpl === null) { this.markHost(false, 'no route'); return false }
+    if (isBlankState(this.state)) return false
     try {
       const response = await fetchImpl(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ state: this.state }),
       })
-      return response.ok
-    } catch { return false }
+      if (!response.ok) { this.markHost(false, 'http ' + String(response.status)); return false }
+      let payload: RoutePayload | null = null
+      try { payload = (await response.json()) as RoutePayload } catch { payload = null }
+      if (payload !== null && payload.ok === false) {
+        this.markHost(false, typeof payload.error === 'string' ? payload.error : 'route refused')
+        return false
+      }
+      this.markHost(true)
+      return true
+    } catch (error) {
+      this.markHost(false, error instanceof Error ? error.message : String(error))
+      return false
+    }
   }
 }

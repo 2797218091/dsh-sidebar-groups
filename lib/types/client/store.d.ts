@@ -25,14 +25,29 @@ export declare class SidebarGroupsStore {
     private readonly options;
     private persistTimer;
     private loaded;
+    private host;
+    private adoptSkipped;
     /** Live workspace section labels, kept out of the persisted document. */
     private workspaces;
     constructor(options?: StoreOptions);
     get(): SidebarGroupsState;
     subscribe(listener: Listener): () => void;
     private emit;
-    /** Replace the whole state (already normalized) and notify. */
+    /**
+     * Replace the whole state (already normalized) and notify.
+     *
+     * A document with no placement at all is NEVER written: that is exactly the
+     * shape a boot-time race can produce (no registry yet), and persisting it
+     * would poison every later session with a "configured but empty" document.
+     * The in-memory state still updates, so the UI shows the truth.
+     */
     replace(next: SidebarGroupsState, persist?: boolean): void;
+    /** 'none' until a route answers; 'ok' / 'err:<message>' after that. */
+    hostStatus(): string;
+    /** How many adoptions were skipped because the id set was empty. */
+    adoptSkips(): number;
+    /** What the last route answer was, for the diagnostics line. */
+    private markHost;
     private section;
     private mutate;
     private findGroup;

@@ -1,9 +1,9 @@
 import { defaultState, normalizeState, resolveDefaultNavGroups, sortEntries, type NavEntry } from './config.js';
-import { DomAdapter, MARKS, SELECTORS } from './dom-adapter.js';
+import { DomAdapter, MARKS, SELECTORS, activeAdapter } from './dom-adapter.js';
 import { SidebarGroupsStore } from './store.js';
 export { defaultState, normalizeState, resolveDefaultNavGroups, sortEntries };
 export type { GroupSpec, NavEntry, SectionSpec, SidebarGroupsState } from './config.js';
-export { DomAdapter, MARKS, SELECTORS };
+export { activeAdapter, DomAdapter, MARKS, SELECTORS };
 export { SidebarGroupsStore };
 export type { SectionName, StoreOptions } from './store.js';
 export { GroupPanel, GroupPanelPortal } from './panel';

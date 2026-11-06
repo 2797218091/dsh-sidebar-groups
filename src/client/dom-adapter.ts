@@ -79,6 +79,12 @@ export interface AdapterHooks {
   setWorkspaceCollapsed(groupId: string, collapsed: boolean): void
   /** Hand the live workspace section labels back so the panel can offer them. */
   onWorkspaces?(keys: string[]): void
+  /**
+   * Hand back the entries this refresh actually aligned against. `source` is
+   * `dom` when the registry was unusable and the ids were derived from the
+   * rendered rows, in registration order.
+   */
+  onEntries?(entries: NavEntry[], source: 'registry' | 'dom'): void
   log?(message: string, detail?: unknown): void
 }
 
@@ -97,6 +103,18 @@ interface Targets {
 
 /** One mounted adapter per document, so two applies can never double-mount. */
 let CURRENT: DomAdapter | null = null
+
+/**
+ * The boot ladder: one frame, then four spaced attempts. Bounded on purpose —
+ * after ~9 seconds the plugin stops trying, so a host this DOM never appears in
+ * costs nothing for the rest of the session.
+ */
+const RETRY_PLAN: readonly (number | 'frame')[] = ['frame', 300, 1000, 2500, 5000]
+
+/** The adapter currently owning the sidebar, if any (diagnostics + tests). */
+export function activeAdapter(): DomAdapter | null {
+  return CURRENT
+}
 
 function globalDocument(): Document | null {
   const candidate = (globalThis as { document?: Document }).document
@@ -164,6 +182,8 @@ export class DomAdapter {
   private readonly win: (Window & typeof globalThis) | null
   private mounted = false
   private disabled = false
+  /** Set by teardown(): a torn-down adapter must not come back on its own. */
+  private retired = false
   private observer: MutationObserver | null = null
   private timer: ReturnType<typeof setTimeout> | null = null
   private releaseTimer: ReturnType<typeof setTimeout> | null = null
@@ -178,6 +198,19 @@ export class DomAdapter {
   private readonly hidden = new Set<Element>()
   private readonly rows = new Map<string, Element>()
   private workspaceKeys: string[] = []
+  /** Why the last `resolve()` did what it did — the panel shows this verbatim. */
+  private lastReason = 'not-attempted'
+  private entriesSource: 'registry' | 'dom' | 'none' = 'none'
+  private retryCancel: (() => void) | null = null
+  private readonly retryLevel = { used: 0 }
+  private scout: MutationObserver | null = null
+  private scoutAttemptedAt = 0
+  private lastEntrySignature = ''
+  /** Last five log lines. The panel prints the newest one; there is no console. */
+  private readonly recent: string[] = []
+  /** Rows this refresh meant to draw / ids in the config that matched no row. */
+  private planned = 0
+  private unmatched = 0
 
   constructor(private readonly env: AdapterEnv, private readonly hooks: AdapterHooks) {
     this.doc = env.doc ?? globalDocument()
@@ -188,13 +221,68 @@ export class DomAdapter {
     return this.mounted
   }
 
+  get isDisabled(): boolean {
+    return this.disabled
+  }
+
+  /** Why the last resolve() ran or bailed: ok / no-root / drawer / ... */
+  get reason(): string {
+    return this.lastReason
+  }
+
+  /** Where the current entry ids came from: registry, dom (degraded), none. */
+  get entrySource(): 'registry' | 'dom' | 'none' {
+    return this.entriesSource
+  }
+
+  /** Retry attempts consumed by the boot ladder (0..5). */
+  get retriesUsed(): number {
+    return this.retryLevel.used
+  }
+
+  /**
+   * One line, plain text, meant to be READ in the panel — never parsed. Every
+   * field here exists because it was the missing fact in a live failure: is the
+   * adapter mounted, why did resolve bail, did the ids line up, did anything
+   * get drawn, and how tall is the container we drew into.
+   */
+  describe(): string {
+    const status = this.disabled ? 'disabled' : this.mounted ? 'mounted' : 'idle'
+    const box = this.navBox
+    const boxHeight = box === null ? 0 : Number((box as unknown as { offsetHeight?: number }).offsetHeight) || 0
+    const navHeight = this.nav === null ? 0 : Number((this.nav as unknown as { offsetHeight?: number }).offsetHeight) || 0
+    return 'adapter=' + status +
+      ' reason=' + this.lastReason +
+      ' entries=' + this.entriesSource +
+      ' retries=' + String(this.retryLevel.used) +
+      ' workspaces=' + String(this.workspaceKeys.length) +
+      ' rows=' + String(this.rows.size) +
+      ' navBox=' + String(box === null ? 0 : box.children.length) +
+      ' planned=' + String(this.planned) +
+      ' unmatched=' + String(this.unmatched) +
+      ' hidden=' + String(this.hidden.size) +
+      ' navH=' + String(navHeight) +
+      ' boxH=' + String(boxHeight) +
+      ' lastLog=' + this.lastLog
+  }
+
   /** Workspace section labels the DOM currently shows (for the panel). */
   getWorkspaces(): string[] {
     return [...this.workspaceKeys]
   }
 
   private log(message: string, detail?: unknown): void {
-    try { this.hooks.log?.(message, detail) } catch { /* logging must never fail the adapter */ }
+    const line = detail === undefined ? message : message + ' :: ' + (detail instanceof Error ? detail.message : String(detail))
+    this.recent.push(line)
+    if (this.recent.length > 5) this.recent.shift()
+    // Deliberately NOT console.*: a plugin that chats in the console is noise the
+    // user cannot turn off. The panel's diagnostics line is the only channel.
+    try { this.hooks.log?.(line) } catch { /* logging must never fail the adapter */ }
+  }
+
+  private get lastLog(): string {
+    const line = this.recent[this.recent.length - 1] ?? ''
+    return line.replace(/\s+/g, '_').slice(0, 60)
   }
 
   private later(callback: () => void, delay: number): ReturnType<typeof setTimeout> | null {
@@ -217,14 +305,26 @@ export class DomAdapter {
    */
   mount(): boolean {
     if (this.disabled) return false
-    if (this.doc === null) return false
+    if (this.doc === null || typeof (this.doc as { querySelector?: unknown }).querySelector !== 'function') {
+      this.lastReason = 'no-document'
+      return false
+    }
+    // An explicit mount() is an intent to run again; the automatic paths
+    // (refresh, retry ladder) never clear this.
+    this.retired = false
     try {
       if (CURRENT !== null && CURRENT !== this) CURRENT.teardown()
       CURRENT = this
       if (this.mounted) { this.refresh(); return true }
       const targets = this.resolve()
-      if (targets === null) return false
+      if (targets === null) {
+        // The host mounts plugins BEFORE React paints, so the first attempt is
+        // expected to miss. Arm a bounded ladder instead of giving up.
+        this.scheduleRetry()
+        return false
+      }
       this.mounted = true
+      this.stopScout()
       this.apply(targets)
       this.observe()
       return true
@@ -234,9 +334,16 @@ export class DomAdapter {
     }
   }
 
-  /** Re-read the DOM and re-render. Cheap enough to run on every debounce. */
+  /**
+   * Re-read the DOM and re-render. Cheap enough to run on every debounce — and
+   * the single place a LATE mount happens: every signal (retry ladder, boot
+   * scout, store change, debounced observer) funnels through here, so an
+   * adapter that missed the boot window mounts on the first one after the
+   * sidebar exists.
+   */
   refresh(): void {
-    if (!this.mounted || this.disabled) return
+    if (this.disabled || this.retired) return
+    if (!this.mounted) { this.mount(); return }
     try {
       const targets = this.resolve()
       if (targets === null) {
@@ -281,23 +388,34 @@ export class DomAdapter {
    */
   private resolve(): Targets | null {
     const doc = this.doc
-    if (doc === null || typeof doc.querySelector !== 'function') return null
-    if (doc.querySelector(SELECTORS.drawer) !== null) return null
-    if (doc.querySelector(SELECTORS.animating) !== null) return null
-    if (doc.querySelector(SELECTORS.dragging) !== null) return null
+    if (doc === null || typeof doc.querySelector !== 'function') { this.lastReason = 'no-document'; return null }
+    if (doc.querySelector(SELECTORS.drawer) !== null) { this.lastReason = 'drawer'; return null }
+    if (doc.querySelector(SELECTORS.animating) !== null) { this.lastReason = 'animating'; return null }
+    if (doc.querySelector(SELECTORS.dragging) !== null) { this.lastReason = 'dragging'; return null }
     const toggle = doc.querySelector(SELECTORS.toggle) ?? doc.querySelector(SELECTORS.opener)
-    const root = toggle !== null ? closestRoot(toggle) : (doc.querySelector(SELECTORS.root) as HTMLElement | null)
-    if (root === null) return null
-    if (/(^|\s)\S*_collapsed(\s|$)/.test(classOf(root))) return null
+    let root: HTMLElement | null = toggle !== null ? closestRoot(toggle) : null
+    if (root === null) {
+      // Fallback only: `[class*="_root"]` is NOT unique — the workspace column's
+      // own root matches it too (DOM-CONTRACT.md §A.1) — so take the one that
+      // actually owns a <nav>.
+      const candidates = typeof doc.querySelectorAll === 'function'
+        ? Array.from(doc.querySelectorAll(SELECTORS.root) as ArrayLike<Element>)
+        : []
+      const hit = candidates.find(candidate => tagOf(candidate) === 'div' && children(candidate).some(kid => tagOf(kid) === 'nav'))
+      root = (hit as HTMLElement | undefined) ?? null
+    }
+    if (root === null) { this.lastReason = 'no-root'; return null }
+    if (/(^|\s)\S*_collapsed(\s|$)/.test(classOf(root))) { this.lastReason = 'rail-collapsed'; return null }
     const kids = children(root)
     const nav = kids.find(kid => tagOf(kid) === 'nav') ?? null
-    if (nav === null) return null
+    if (nav === null) { this.lastReason = 'no-nav'; return null }
     const navIndex = kids.indexOf(nav)
     const top = kids.slice(0, navIndex).filter(kid => tagOf(kid) !== 'script') as HTMLElement[]
     const after = kids.slice(navIndex + 1)
     const foot = (after[after.length - 1] ?? null) as HTMLElement | null
     const treeCandidate = doc.querySelector(SELECTORS.tree) as HTMLElement | null
     const tree = treeCandidate !== null && root.contains(treeCandidate) ? treeCandidate : null
+    this.lastReason = 'ok'
     return { root, nav: nav as HTMLElement, foot, top, tree }
   }
 
@@ -327,7 +445,14 @@ export class DomAdapter {
    * moment the new scrollbar appears.
    */
   private applyScroll(targets: Targets): void {
-    const { root, tree, top, foot } = targets
+    const { root, tree, top, foot, nav } = targets
+    // The nav is the only shrinkable flex item between the fixed top block and
+    // the (now natural-height) workspace area, and our grouped rows live inside
+    // it: left alone it can collapse to zero height and clip them. Same reason
+    // as the tree chain below — this one is about OUR container, not theirs.
+    this.setStyle(nav, 'flex', 'none')
+    this.setStyle(nav, 'min-height', 'auto')
+    this.setStyle(nav, 'overflow', 'visible')
     this.setStyle(root, 'height', '100%')
     this.setStyle(root, 'overflow-y', 'auto')
     this.setStyle(root, 'overflow-x', 'hidden')
@@ -404,51 +529,164 @@ export class DomAdapter {
 
   private renderNav(state: SidebarGroupsState): void {
     const nav = this.nav
-    if (nav === null) return
-    const entries = this.readEntries()
-    if (entries.length === 0) return
+    if (nav === null) { this.log('render: no <nav>'); return }
     const rows = this.panelRows(nav)
+    const entries = this.readEntries(rows)
+    if (entries.length === 0) { this.planned = 0; this.log('render: no entries'); return }
     const mapped = this.align(rows, entries)
-    this.rows.clear()
-    for (const [id, row] of mapped) this.rows.set(id, row)
+    // The framework's own overflow launcher: a <button> in the nav that is not
+    // one of the registered panel rows (it carries aria-haspopup).
+    const more = this.nativeMore(nav, new Set(mapped.values()))
 
-    const box = this.ensureBox(nav, MARKS.nav, this.navBox)
-    this.navBox = box
-    box.textContent = ''
-
+    // PLAN FIRST, MUTATE LATER.
+    //
+    // A frame that would draw nothing must never be allowed to blank a container
+    // that is already showing a good result: one transient bad frame (an empty
+    // registry, a dom:-derived id set, a re-render in the middle of a resize)
+    // would otherwise wipe the groups until something else fixed them. So the
+    // frame is built off-document, and the live container is only touched when
+    // there is something to put in it — or when the config genuinely holds
+    // nothing, in which case an empty container is the truth.
+    const configured = state.nav.groups.reduce((sum, group) => sum + group.items.length, 0)
+    const frames: HTMLElement[] = []
     const assigned = new Set<string>()
-    const groups = state.nav.groups
-    for (const group of groups) {
+    let planned = 0
+    let unmatched = 0
+    for (const group of state.nav.groups) {
       const items = group.items.filter(id => mapped.has(id))
-      if (items.length === 0 && group.showHeader) continue
-      if (group.showHeader) box.appendChild(this.groupHeader(group, 'nav'))
+      planned += items.length
+      unmatched += group.items.length - items.length
+      // An empty group header is a readable clue; silence is not. So a group
+      // that HOLDS configured ids keeps its header even when none of them
+      // matched this frame — but a group with no configured ids at all draws
+      // nothing, because there is nothing to explain.
+      if (group.showHeader && group.items.length > 0) frames.push(this.groupHeader(group, 'nav'))
       // Rows of a folded group stay HIDDEN in the framework's nav (they are
       // still "assigned"), they are simply not drawn by us.
       for (const id of items) assigned.add(id)
       if (group.collapsed) continue
-      for (const id of items) box.appendChild(this.itemRow(id, mapped.get(id)!, entries))
+      for (const id of items) frames.push(this.itemRow(id, mapped.get(id)!, entries))
     }
+    this.planned = planned
+    this.unmatched = unmatched
+
+    const box = this.ensureBox(nav, MARKS.nav, this.navBox)
+    this.navBox = box
+    this.styleBox(box)
+    if (planned === 0 && configured > 0 && box.children.length > 0) {
+      // Not one configured id matched this frame, and the container is already
+      // showing a good result: keep it verbatim and record the mismatch. A
+      // transient registry hiccup must never be able to blank the sidebar.
+      this.log('render kept: planned=0 unmatched=' + String(unmatched))
+      return
+    }
+    box.textContent = ''
+    for (const node of frames) box.appendChild(node)
+    this.rows.clear()
+    for (const [id, row] of mapped) this.rows.set(id, row)
     // Anything the config has never seen stays where the framework put it.
     for (const [id, row] of mapped) {
       if (assigned.has(id)) this.hideRow(row)
       else this.showRow(row)
     }
-    // Re-append: React may have inserted one of its own children after us.
-    nav.appendChild(box)
+    // Two entries named 更多 sitting next to each other, doing the same job,
+    // read as a bug — 插件 and 插件市场 already have their own rows in this
+    // list. So once we actually render something, the native launcher goes;
+    // with nothing rendered it stays, because then it is the only way in.
+    if (more !== null) {
+      if (assigned.size > 0) this.hideRow(more)
+      else this.showRow(more)
+    }
+    // Keep our container ABOVE that launcher: with ten rows hidden, a launcher
+    // left last would jump to the top of the column and sit on our groups.
+    if (more !== null && (more as unknown as { parentNode?: unknown }).parentNode === nav) nav.insertBefore(box, more)
+    else nav.appendChild(box)
+    this.log('render planned=' + String(planned) + ' drawn=' + String(box.children.length) + ' assigned=' + String(assigned.size))
     this.syncActive()
   }
 
-  private readEntries(): NavEntry[] {
+  /** The framework's overflow launcher: the non-registry button in the nav. */
+  private nativeMore(nav: HTMLElement, _mappedRows: Set<Element>): HTMLElement | null {
+    // Identify the launcher by its own markup, never by elimination: once every
+    // panel row is mapped, elimination returns null and the launcher is left
+    // visible at the top of the column, on top of our groups.
+    // The launcher lives inside the framework's Menu anchor, so it is a grand-
+    // child rather than a direct button child of the nav. Walk up to the child
+    // of `nav` that contains it: that wrapper is what must be hidden and what
+    // our container has to be inserted before.
+    const direct = children(nav)
+      .filter(kid => tagOf(kid) === 'button')
+      .find(kid => kid.hasAttribute('aria-haspopup')) as HTMLElement | undefined
+    const nested = direct !== undefined
+      ? null
+      : (typeof nav.querySelector === 'function'
+        ? (nav.querySelector('button[aria-haspopup]') as HTMLElement | null)
+        : null)
+    const button = direct ?? nested
+    if (button === null || button === undefined) return null
+    let cursor: HTMLElement | null = button
+    while (cursor !== null && cursor.parentElement !== null && cursor.parentElement !== nav) {
+      cursor = cursor.parentElement
+    }
+    return cursor
+  }
+
+  /** Our container is a flex column that never shrinks inside the nav. */
+  private styleBox(box: HTMLElement): void {
+    const style = box.style
+    if (style === undefined || style === null) return
+    style.setProperty('display', 'flex')
+    style.setProperty('flex-direction', 'column')
+    style.setProperty('flex', 'none')
+    style.setProperty('min-height', '0')
+    style.setProperty('width', '100%')
+  }
+
+  /**
+   * The entries to align against.
+   *
+   * Normally the registry's (`ctx.slots.entriesOfSlot('sidebar.panellist')`).
+   * When that API is missing or empty — a host that never filled the slot table,
+   * or a build where `slots.entriesOfSlot` does not exist — the ids are derived
+   * from the RENDERED ROWS, in registration order, and the label is the row's
+   * own `aria-label`. Grouping keeps working, it just loses the durable id.
+   */
+  private readEntries(rows: HTMLElement[]): NavEntry[] {
+    let entries: NavEntry[] = []
     try {
       const value = this.hooks.entries()
-      if (!Array.isArray(value)) return []
-      return value.filter(entry => typeof entry?.id === 'string' && entry.id !== '')
-    } catch { return [] }
+      if (Array.isArray(value)) entries = value.filter(entry => typeof entry?.id === 'string' && entry.id !== '')
+    } catch { entries = [] }
+    if (entries.length > 0) {
+      this.entriesSource = 'registry'
+      this.publishEntries(entries, 'registry')
+      return entries
+    }
+    if (rows.length === 0) { this.entriesSource = 'none'; return [] }
+    this.entriesSource = 'dom'
+    const derived: NavEntry[] = rows.map((row, index) => ({
+      id: 'dom:' + String(index),
+      order: index,
+      label: row.getAttribute('aria-label') ?? 'panel-' + String(index + 1),
+    }))
+    this.publishEntries(derived, 'dom')
+    return derived
+  }
+
+  /** Tell the caller which entries were used, but only when that changed. */
+  private publishEntries(entries: NavEntry[], source: 'registry' | 'dom'): void {
+    const signature = source + '|' + entries.map(entry => entry.id + '=' + entry.label).join(',')
+    if (signature === this.lastEntrySignature) return
+    this.lastEntrySignature = signature
+    try { this.hooks.onEntries?.(entries, source) } catch { /* the caller's problem, not ours */ }
   }
 
   /** The framework's own panel buttons: direct `<button>` children of the nav. */
   private panelRows(nav: HTMLElement): HTMLElement[] {
-    return children(nav).filter(kid => tagOf(kid) === 'button') as HTMLElement[]
+    // The framework's overflow launcher is a button in the same list but it is
+    // NOT a panel row: mapping a registry entry onto it would hide the launcher
+    // behind a fake row and make `nativeMore()` come back empty.
+    return children(nav).filter(kid => tagOf(kid) === 'button' && !kid.hasAttribute('aria-haspopup')) as HTMLElement[]
   }
 
   /**
@@ -658,6 +896,73 @@ export class DomAdapter {
     } catch { this.observer = null }
   }
 
+  /**
+   * Bounded ladder for the boot race: the host mounts plugins BEFORE React has
+   * painted the sidebar, so the first mount is expected to miss. Five attempts
+   * (one frame, then 300 / 1000 / 2500 / 5000 ms), then it stops for good.
+   *
+   * Nothing polls: a MutationObserver on `document.body` watches for the frame
+   * to appear and disconnects itself on the first successful mount, and every
+   * other signal (store change, debounced observer) reaches the same
+   * `refresh()`, which mounts if needed.
+   */
+  private scheduleRetry(): void {
+    if (this.disabled || this.mounted || this.retryCancel !== null) return
+    const step = RETRY_PLAN[this.retryLevel.used]
+    if (step === undefined) return
+    this.retryLevel.used += 1
+    this.startScout()
+    const settle = (): void => { this.retryCancel = null; this.attemptMount() }
+    if (step === 'frame') {
+      const host = this.win as { requestAnimationFrame?: (callback: () => void) => number; cancelAnimationFrame?: (handle: number) => void } | null
+      if (typeof host?.requestAnimationFrame === 'function') {
+        const handle = host.requestAnimationFrame(settle)
+        this.retryCancel = () => {
+          try { host.cancelAnimationFrame?.(handle) } catch { /* gone */ }
+          this.retryCancel = null
+        }
+        return
+      }
+      const fallback = this.later(settle, 16)
+      this.retryCancel = () => { this.cancel(fallback); this.retryCancel = null }
+      return
+    }
+    const handle = this.later(settle, step)
+    this.retryCancel = () => { this.cancel(handle); this.retryCancel = null }
+  }
+
+  private attemptMount(): void {
+    if (this.disabled || this.retired || this.mounted) { this.stopScout(); return }
+    if (this.mount()) return
+    // mount() re-arms the ladder on failure; reaching here means it is either
+    // exhausted or disabled, and stopScout() keeps no observer alive.
+    if (this.retryLevel.used >= RETRY_PLAN.length) this.stopScout()
+  }
+
+  private startScout(): void {
+    if (this.scout !== null) return
+    const body = this.doc?.body
+    const Ctor = (this.win as { MutationObserver?: typeof MutationObserver } | null)?.MutationObserver
+    if (typeof Ctor !== 'function' || body === null || body === undefined) return
+    try {
+      this.scout = new Ctor(() => {
+        if (this.suppress) return
+        // Boot mutates the body continuously; one resolve() per 100 ms is
+        // plenty and keeps the scout from costing anything real.
+        const now = Date.now()
+        if (now - this.scoutAttemptedAt < 100) return
+        this.scoutAttemptedAt = now
+        this.attemptMount()
+      })
+      this.scout.observe(body, { childList: true, subtree: true })
+    } catch { this.scout = null }
+  }
+
+  private stopScout(): void {
+    try { this.scout?.disconnect() } catch { /* already gone */ }
+    this.scout = null
+  }
+
   private markDirty(): void {
     if (!this.mounted || this.disabled || this.suppress) return
     this.cancel(this.timer)
@@ -676,10 +981,14 @@ export class DomAdapter {
     this.cancel(this.releaseTimer)
     this.timer = null
     this.releaseTimer = null
+    this.retryCancel?.()
+    this.retryCancel = null
+    this.stopScout()
     try { this.observer?.disconnect() } catch { /* already gone */ }
     this.observer = null
     this.suppress = false
     this.mounted = false
+    this.retired = true
     for (const row of [...this.hidden]) {
       try { this.showRow(row) } catch { /* detached */ }
     }
@@ -708,8 +1017,8 @@ export class DomAdapter {
 const FALLBACK_STATE: SidebarGroupsState = {
   version: 1,
   scrolling: true,
-  nav: { groups: [] },
-  workspaces: { groups: [] },
+  nav: { groups: [], configured: true },
+  workspaces: { groups: [], configured: true },
 }
 
 export function createDomAdapter(env: AdapterEnv, hooks: AdapterHooks): DomAdapter {

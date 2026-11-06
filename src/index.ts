@@ -131,7 +131,9 @@ function safeParse(text: string): Record<string, unknown> | null {
  * bundle mounts the same package under a different id (DOM-CONTRACT.md G.3).
  */
 export function ownEntryId(ctx: HostContext): string | undefined {
-  const entries = ctx.loader?.entries?.()
+  const loader = serviceOf(ctx, 'loader') as
+    { entries?: () => Array<{ options?: { id?: unknown; name?: unknown }; fiber?: unknown; disabled?: unknown }> } | undefined
+  const entries = loader?.entries?.()
   if (!Array.isArray(entries)) return undefined
   let fallback: string | undefined
   for (const entry of entries) {
@@ -144,22 +146,53 @@ export function ownEntryId(ctx: HostContext): string | undefined {
   return fallback
 }
 
-function describeValue(
-  settings: SettingsService,
-  ns: string,
-): { descriptor?: SettingsDescriptor; state: SidebarGroupsState | null } {
+interface DescribedValue {
+  descriptor?: SettingsDescriptor
+  state: SidebarGroupsState | null
+  /** Set when the settings service refused to describe — never thrown. */
+  error?: string
+}
+
+function describeValue(settings: SettingsService, ns: string): DescribedValue {
   let descriptors: SettingsDescriptor[] = []
-  try { descriptors = settings.describe({ redactSecrets: true }) } catch { return { state: null } }
-  const descriptor = Array.isArray(descriptors) ? descriptors.find(candidate => candidate?.ns === ns) : undefined
-  const value = descriptor?.value as { state?: unknown } | undefined
-  const raw = value === null || value === undefined ? undefined : value.state
-  if (raw === undefined || raw === null) return { descriptor, state: null }
-  return { descriptor, state: normalizeState(raw) }
+  try { descriptors = settings.describe({ redactSecrets: true }) } catch (error) {
+    return { state: null, error: messageOf(error) }
+  }
+  try {
+    const descriptor = Array.isArray(descriptors) ? descriptors.find(candidate => candidate?.ns === ns) : undefined
+    const value = descriptor?.value as { state?: unknown } | undefined
+    const raw = value === null || value === undefined ? undefined : value.state
+    if (raw === undefined || raw === null) return { descriptor, state: null }
+    return { descriptor, state: normalizeState(raw) }
+  } catch (error) {
+    return { state: null, error: messageOf(error) }
+  }
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Cordis service access that cannot throw. A bare `ctx.connection` on a context
+ * that never injected it throws "cannot get property ... without inject", which
+ * is exactly how the state route failed on the first live run, so every optional
+ * service is taken through `ctx.get()` first and a guarded read second.
+ */
+function serviceOf(ctx: HostContext, name: string): unknown {
+  const getter = (ctx as unknown as { get?: (key: string) => unknown }).get
+  if (typeof getter === 'function') {
+    try {
+      const value = getter.call(ctx, name)
+      if (value !== undefined) return value
+    } catch { /* fall through to the property read */ }
+  }
+  try { return (ctx as unknown as Record<string, unknown>)[name] } catch { return undefined }
 }
 
 /** Where a pre-0.1.0 release kept its own JSON, before the settings namespace. */
 function legacyPath(ctx: HostContext): string {
-  const home = ctx.profileContext?.home
+  const home = (serviceOf(ctx, 'profileContext') as { home?: unknown } | undefined)?.home
   return typeof home === 'string' && home !== ''
     ? path.join(home, LEGACY_FILE)
     : path.join(os.homedir(), '.dsh', LEGACY_FILE)
@@ -179,6 +212,7 @@ export function importLegacy(
   try { exists = fs.existsSync(file) } catch { return 'no-file' }
   if (!exists) return 'no-file'
   const current = describeValue(settings, ns)
+  if (current.error !== undefined) return 'failed'
   if (current.state !== null) return 'already-configured'
   try {
     const parsed = safeParse(fs.readFileSync(file, 'utf8'))
@@ -198,7 +232,9 @@ export function apply(ctx: HostContext, config?: { state?: unknown }): void {
   void config // the loader validates it against Config; the client is the reader
   if (ctx === undefined || ctx === null || typeof ctx !== 'object') return
   let settings: SettingsService | undefined
-  const nsOf = (): string => ownEntryId(ctx) ?? NAMESPACE
+  const nsOf = (): string => {
+    try { return ownEntryId(ctx) ?? NAMESPACE } catch { return NAMESPACE }
+  }
 
   if (typeof ctx.inject !== 'function') return
 
@@ -214,7 +250,8 @@ export function apply(ctx: HostContext, config?: { state?: unknown }): void {
       const timer = setTimeout(() => {
         try {
           const outcome = importLegacy(ctx, service, ns)
-          if (outcome === 'imported') ctx.logger?.info?.(PACKAGE_NAME + ': imported the legacy ' + LEGACY_FILE)
+          const logger = serviceOf(ctx, 'logger') as { info?: (line: string) => void } | undefined
+          if (outcome === 'imported') logger?.info?.(PACKAGE_NAME + ': imported the legacy ' + LEGACY_FILE)
         } catch { /* migration is best effort */ }
       }, 2000)
       try { ctx.effect?.(() => () => { clearTimeout(timer) }, PACKAGE_NAME + ': legacy import timer') } catch { /* host without effect */ }
@@ -225,54 +262,90 @@ export function apply(ctx: HostContext, config?: { state?: unknown }): void {
     ctx.inject(['webServer'], ready => {
       const server = ready.webServer
       if (server === undefined || typeof server.register !== 'function') return
+      /**
+       * NEVER a 5xx.
+       *
+       * The desktop shell renders a failed fetch as a bare console line with no
+       * body, so a 500 here hides the only thing that matters — WHY it failed.
+       * Every branch below answers 200 with a body the client can print in its
+       * diagnostics line; `ok` is what tells the client whether to trust it.
+       * (A private route that only this plugin reads does not need the status
+       * code to carry the meaning.)
+       */
+      const fail = (response: HostResponse, stage: string, error: unknown): void => {
+        writeJson(response, 200, { ok: false, state: null, error: stage + ': ' + messageOf(error) })
+      }
       const handler = async (request: HostRequest, response: HostResponse): Promise<void> => {
+        let stage = 'start'
         try {
-          const rejected = ctx.connection?.requestRejection?.(request)
-          if (rejected !== undefined) { writeJson(response, 403, { ok: false, error: 'forbidden' }); return }
+          stage = 'fence'
+          const connection = serviceOf(ctx, 'connection') as
+            { requestRejection?: (value: unknown) => unknown } | undefined
+          const fence = connection?.requestRejection
+          if (typeof fence === 'function') {
+            let rejected: unknown
+            try { rejected = fence.call(connection, request) } catch (error) {
+              // A fence that throws is treated as a refusal, not as an opening.
+              fail(response, 'fence', error)
+              return
+            }
+            if (rejected !== undefined) {
+              writeJson(response, 200, { ok: false, state: null, error: 'fence: rejected' })
+              return
+            }
+          }
+          stage = 'url'
           const pathname = new URL(String(request.url ?? '/'), 'http://dsh.internal').pathname
           const prefix = ROUTE_PREFIX + '/'
           const method = pathname.startsWith(prefix) ? pathname.slice(prefix.length) : ''
+          stage = 'settings'
           const service = settings
           if (service === undefined) {
-            writeJson(response, 503, { ok: false, error: 'settings-service-missing' })
+            writeJson(response, 200, { ok: false, state: null, error: 'settings: the settings service is not mounted' })
             return
           }
+          stage = 'namespace'
           const ns = nsOf()
           if (method === 'state') {
+            stage = 'describe'
             const view = describeValue(service, ns)
+            if (view.error !== undefined) {
+              writeJson(response, 200, { ok: false, state: null, error: 'describe: ' + view.error })
+              return
+            }
             writeJson(response, 200, { ok: true, state: view.state, revision: view.descriptor?.revision })
             return
           }
           if (method === 'update') {
+            stage = 'method'
             if (String(request.method ?? 'GET').toUpperCase() !== 'POST') {
-              writeJson(response, 405, { ok: false, error: 'method' })
+              writeJson(response, 200, { ok: false, state: null, error: 'method: expected POST' })
               return
             }
+            stage = 'body'
             const body = safeParse(await readBody(request))
             if (body === null || !('state' in body)) {
-              writeJson(response, 400, { ok: false, error: 'bad-request' })
+              writeJson(response, 200, { ok: false, state: null, error: 'body: expected { state }' })
               return
             }
             const state = normalizeState(body.state)
+            stage = 'describe'
             const view = describeValue(service, ns)
+            stage = 'update'
             try {
               await service.update(ns, { state, legacyImported: true }, view.descriptor?.revision)
             } catch (error) {
               // A concurrent writer won the revision race: report it instead of
               // silently overwriting someone else's document.
-              writeJson(response, 409, {
-                ok: false,
-                error: 'conflict',
-                message: error instanceof Error ? error.message : String(error),
-              })
+              fail(response, 'update', error)
               return
             }
             writeJson(response, 200, { ok: true, state })
             return
           }
-          writeJson(response, 404, { ok: false, error: 'not-found' })
+          writeJson(response, 200, { ok: false, state: null, error: 'route: unknown method "' + method + '"' })
         } catch (error) {
-          writeJson(response, 500, { ok: false, error: error instanceof Error ? error.message : String(error) })
+          fail(response, stage, error)
         }
       }
       try {
