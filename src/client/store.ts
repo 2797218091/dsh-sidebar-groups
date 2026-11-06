@@ -235,6 +235,14 @@ export class SidebarGroupsStore {
       this.adoptSkipped += 1
       return false
     }
+    // Entries whose labels have not resolved yet are the same kind of "no
+    // information": seeding the preset against them picks the wrong panel ids
+    // (observed live: 插件 / 上下文洞察 / HyperFrames instead of 插件 / 插件市场 /
+    // 任务看板) and that choice then persists. Wait for at least one real label.
+    if (!entries.some(entry => typeof entry.label === 'string' && entry.label.trim() !== '')) {
+      this.adoptSkipped += 1
+      return false
+    }
     const result = syncNavGroups(this.state, entries)
     if (!result.changed) return false
     // `replace` refuses to persist a blank document, so an adoption that has

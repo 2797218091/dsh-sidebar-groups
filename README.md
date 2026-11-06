@@ -176,6 +176,10 @@ interface GroupSpec {
     normalize 之后就是出厂默认），但别指望在配置里稳定读到 `null`。
 12. **图标条态与窄屏抽屉态下插件整体不接管。** 侧栏收成 56 px 轨道、或窄屏抽屉模式（含抽屉关闭态）、
     以及宽度动画 / 拖拽进行中，适配层整轮跳过：那几态没有整列滚动改造，也没有分组，表现和原生一致。
+14. **极少数情况下默认预设会认错顶层三项。** 插件在 boot 期就给「常用」组选三项；如果那一刻 slot 注册表还没填满（只到 3～4 项），
+    「插件市场 / 任务看板」可能还没注册进来，预设就会用按位置的兜底项（真机上出现过 `上下文洞察 / HyperFrames`）。
+    **修复只要一次点击**：打开「分组」面板 → 底部「恢复默认」，它会拿当前完整注册表重算并落盘。
+    （v0.1.0 里加了 STATE_VERSION 版本闸与「label 未解析就不落盘」两道护栏，但注册表"填满与否"仍无法在 boot 期判断。）
 13. **配置落在 localStorage，不回写 profile 的挂载行。** 本机实测：DSH 的 settings 服务拒绝覆盖由
     `cordis.patch.yml` 注入的 entry，写入会回 `Configuration for "sidebar-groups" is overridden by a
     home patch or command line`（面板诊断行里能看到这条原文，字段 `host=`）。所以插件把状态保存在

@@ -41,7 +41,7 @@ export interface SidebarGroupsState {
     nav: SectionSpec;
     workspaces: SectionSpec;
 }
-export declare const STATE_VERSION = 1;
+export declare const STATE_VERSION = 3;
 export declare const TOP_GROUP_ID = "top";
 export declare const MORE_GROUP_ID = "more";
 export declare const WORKSPACE_GROUP_ID = "ws-all";

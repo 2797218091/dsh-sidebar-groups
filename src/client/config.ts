@@ -46,7 +46,7 @@ export interface SidebarGroupsState {
   workspaces: SectionSpec
 }
 
-export const STATE_VERSION = 1
+export const STATE_VERSION = 3
 
 export const TOP_GROUP_ID = 'top'
 export const MORE_GROUP_ID = 'more'
@@ -137,6 +137,11 @@ export function normalizeState(raw: unknown): SidebarGroupsState {
   const base = defaultState()
   const record = asRecord(raw)
   if (record === null) return base
+  // A document written by another release is discarded, not upgraded: version 1
+  // could be seeded before the panel labels resolved, which pinned the wrong
+  // three ids into the open group (observed live). Re-seeding from the current
+  // registry is cheap for the user (one click at most) and always correct.
+  if (typeof record.version === 'number' && record.version !== STATE_VERSION) return base
   const nav = asRecord(record.nav)
   const workspaces = asRecord(record.workspaces)
   return {
