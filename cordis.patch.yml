@@ -1,0 +1,12 @@
+# Bundle patch for dsh-sidebar-groups.
+#
+# A dependency whose manifest declares `dsh.bundle.patch` joins the profile's
+# layer stack; this insert row is what actually mounts the plugin. Without it
+# the package installs and does nothing ("declares no dsh.bundle").
+#
+# The row id doubles as the settings namespace: dsh-settings addresses a plugin
+# form by its loader entry id, so `id` here must equal the namespace the client
+# half talks to (see src/index.ts, NAMESPACE).
+- insert:
+    - id: sidebar-groups
+      name: dsh-sidebar-groups

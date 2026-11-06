@@ -1,0 +1,10 @@
+# lib/ is a BUILD ARTIFACT THAT SHIPS. It must never be ignored: the package is
+# installed from source with no prepare/postinstall step, so lib/ is the plugin.
+# (Only the .gitignore itself lives here to keep the tree clean of junk.)
+
+node_modules/
+*.tgz
+*.log
+.DS_Store
+.pnpm-store/
+tsconfig.tsbuildinfo

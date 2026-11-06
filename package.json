@@ -1,0 +1,77 @@
+{
+  "name": "dsh-sidebar-groups",
+  "version": "0.1.0",
+  "description": "Scrollable + collapsible sidebar for DSH: make the whole left column scroll as one area, group the panel navigation and the workspace list into foldable groups, and keep the layout after a restart.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/types/index.d.ts",
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/types/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ],
+      "platform": "web"
+    },
+    "engines": {
+      "dsh": ">=0.2.1-rc.1"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "sidebar",
+    "sidebar-groups",
+    "scroll",
+    "collapse"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/2797218091/dsh-sidebar-groups.git"
+  },
+  "homepage": "https://github.com/2797218091/dsh-sidebar-groups#readme",
+  "bugs": {
+    "url": "https://github.com/2797218091/dsh-sidebar-groups/issues"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "tsdown": "^0.22.14",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "build": "tsdown && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "smoke": "node scripts/smoke.mjs"
+  }
+}

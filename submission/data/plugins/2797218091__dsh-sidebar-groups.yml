@@ -1,0 +1,6 @@
+url: https://github.com/2797218091/dsh-sidebar-groups
+name: 2797218091/dsh-sidebar-groups
+category: ui
+description:
+  en: 'Scrolls the whole DSH sidebar as one area so panel rows and workspaces stop being clipped by window height, and groups either list into foldable groups that survive a restart.'
+  zh: 'DSH 左侧栏整列滚动：导航项与工作区合成一个滚动区，靠下的条目不再被窗口高度裁掉；导航项与工作区各自可分组折叠，归属、折叠态与顺序在重启后保留。顶部与底部固定不动。'
