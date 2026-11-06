@@ -203,6 +203,12 @@ Ordered by impact. These are not a wish list — they are the real edges of the 
 12. **The icon rail and the narrow drawer mode are left entirely alone.** With the sidebar collapsed to its 56 px rail, in the
     narrow drawer mode (including the closed drawer), or while a width animation or a drag is running, the adapter skips the
     whole pass: no scrolling rework and no grouping there, so those states behave exactly like stock.
+13. **State lives in localStorage and is not written back into the profile mount row.** Measured on this machine: DSH's
+    settings service refuses to override an entry injected by `cordis.patch.yml` and answers `Configuration for
+    "sidebar-groups" is overridden by a home patch or command line` (the panel's diagnostics line prints that原文 under
+    `host=`). The plugin therefore keeps its state in the desktop app's own localStorage, which is persistent and survives a
+    full DSH restart, and treats it as the local mirror; if a future DSH allows writing mount-row config, the host route will
+    store the same state there without any client change.
 
 ## Uninstall
 

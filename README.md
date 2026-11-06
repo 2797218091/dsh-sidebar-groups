@@ -176,6 +176,11 @@ interface GroupSpec {
     normalize 之后就是出厂默认），但别指望在配置里稳定读到 `null`。
 12. **图标条态与窄屏抽屉态下插件整体不接管。** 侧栏收成 56 px 轨道、或窄屏抽屉模式（含抽屉关闭态）、
     以及宽度动画 / 拖拽进行中，适配层整轮跳过：那几态没有整列滚动改造，也没有分组，表现和原生一致。
+13. **配置落在 localStorage，不回写 profile 的挂载行。** 本机实测：DSH 的 settings 服务拒绝覆盖由
+    `cordis.patch.yml` 注入的 entry，写入会回 `Configuration for "sidebar-groups" is overridden by a
+    home patch or command line`（面板诊断行里能看到这条原文，字段 `host=`）。所以插件把状态保存在
+    桌面端自己的 localStorage（与 profile 同机持久，**关掉重开 DSH 仍然保留**），并把它当作本地镜像；
+    一旦哪天 DSH 允许写挂载行配置，host 侧路由会把同一份 state 写进去，客户端不需要改。
 
 ## 卸载
 
